@@ -37,6 +37,16 @@ const RUN_PREFIX: Record<PackageManager, string[]> = {
   bun: ["bun", "run"],
 };
 
+// npm consumes flags itself unless they're behind `--`; pnpm forwards a
+// literal `--` to the script (Next.js then reads `-p` as its project-directory
+// positional), and pnpm/yarn/bun all forward flags fine without a separator.
+const PASSTHROUGH_SEP: Record<PackageManager, string[]> = {
+  pnpm: [],
+  yarn: [],
+  npm: ["--"],
+  bun: [],
+};
+
 /** Pick the dev script, preferring `dev` then `start`. */
 function pickDevScript(scripts: Record<string, string>): string {
   if (scripts.dev) return "dev";
@@ -65,11 +75,16 @@ export function detectFramework(worktree: string): FrameworkInfo {
   // Force a deterministic port so we can point Playwright / the browser at it.
   const portFlag =
     framework === "nextjs"
-      ? ["--", "-p", String(appPort)]
+      ? ["-p", String(appPort)]
       : framework === "vite"
-        ? ["--", "--port", String(appPort), "--strictPort"]
+        ? ["--port", String(appPort), "--strictPort"]
         : [];
-  const devCommand = [...RUN_PREFIX[pm], script, ...portFlag];
+  const devCommand = [
+    ...RUN_PREFIX[pm],
+    script,
+    ...(portFlag.length > 0 ? PASSTHROUGH_SEP[pm] : []),
+    ...portFlag,
+  ];
 
   const { envVars, hardcodedHosts } = scanEnv(worktree);
 
