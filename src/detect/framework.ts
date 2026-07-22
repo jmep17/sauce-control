@@ -47,11 +47,45 @@ const PASSTHROUGH_SEP: Record<PackageManager, string[]> = {
   bun: [],
 };
 
-/** Pick the dev script, preferring `dev` then `start`. */
-function pickDevScript(scripts: Record<string, string>): string {
-  if (scripts.dev) return "dev";
-  if (scripts.start) return "start";
-  if (scripts.serve) return "serve";
+const DEV_NAME_ORDER = ["dev", "develop", "start", "serve"];
+
+/** Does this script body actually launch the framework's dev server? */
+function isDevServerScript(body: string, framework: Framework): boolean {
+  if (framework === "nextjs") {
+    const m = /\bnext\b(?:\s+([a-z]+))?/.exec(body);
+    return m !== null && m[1] === "dev";
+  }
+  if (framework === "vite") {
+    // Bare `vite` (or `vite dev`/`vite serve`) starts the dev server; only
+    // subcommands like build/preview don't.
+    const m = /\bvite\b(?:\s+([a-z]+))?/.exec(body);
+    return (
+      m !== null && (m[1] === undefined || ["dev", "serve"].includes(m[1]))
+    );
+  }
+  return false;
+}
+
+/**
+ * Pick the dev script by content — whichever script invokes the framework's
+ * dev server, whatever it's named — falling back to conventional names.
+ */
+function pickDevScript(
+  scripts: Record<string, string>,
+  framework: Framework
+): string {
+  const names = Object.keys(scripts);
+  const matches = Object.entries(scripts)
+    .filter(([, body]) => isDevServerScript(body, framework))
+    .map(([name]) => name);
+  for (const preferred of DEV_NAME_ORDER) {
+    if (matches.includes(preferred)) return preferred;
+  }
+  const [firstMatch] = matches;
+  if (firstMatch) return firstMatch;
+  for (const preferred of DEV_NAME_ORDER) {
+    if (names.includes(preferred)) return preferred;
+  }
   return "dev";
 }
 
@@ -71,7 +105,7 @@ export function detectFramework(worktree: string): FrameworkInfo {
     appPort = 5173;
   }
 
-  const script = pickDevScript(scripts);
+  const script = pickDevScript(scripts, framework);
   // Force a deterministic port so we can point Playwright / the browser at it.
   const portFlag =
     framework === "nextjs"
