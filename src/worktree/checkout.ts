@@ -35,21 +35,29 @@ export async function ensureWorktree(
     await run("git", ["clone", "--mirror", cloneUrl, mirror]);
   } else {
     log.step(`Refreshing mirror ${org}/${repo}…`);
-    await run("git", ["--git-dir", mirror, "remote", "update", "--prune"]);
+    // A mirror fetches +refs/*:refs/* straight into refs/heads/*, which git
+    // refuses for branches checked out in a worktree. --update-head-ok lifts
+    // that guard; reused worktrees are hard-reset to the moved tip below.
+    await run("git", [
+      "--git-dir",
+      mirror,
+      "fetch",
+      "--prune",
+      "--update-head-ok",
+      "origin",
+    ]);
   }
 
   const wt = worktreePath(org, repo, branch);
   const git: SimpleGit = simpleGit();
 
   if (fs.existsSync(wt)) {
-    // Reuse: reset the worktree to the latest branch tip.
+    // Reuse: the mirror refresh above already moved refs/heads/<branch>
+    // (a mirror has no origin/* refs), so just sync files to the new tip.
     log.step(`Reusing worktree at ${wt}`);
     const wtGit = simpleGit(wt);
-    await wtGit.raw(["fetch", "origin"]);
     await wtGit.raw(["checkout", branch]);
-    await wtGit.raw(["reset", "--hard", `origin/${branch}`]).catch(() => {
-      // Local-only or detached branch; leave as-is.
-    });
+    await wtGit.raw(["reset", "--hard", "HEAD"]);
     return { worktree: wt, mirror, branch };
   }
 
