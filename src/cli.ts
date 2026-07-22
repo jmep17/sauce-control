@@ -23,7 +23,20 @@ program
   .description(
     "Record an Auth0-backed repo's network traffic, then relaunch it fully offline against a self-issuing mock proxy."
   )
-  .version("0.1.0");
+  .version("0.1.0")
+  .showHelpAfterError("(run `sauce-control --help` to see all commands)")
+  .addHelpText(
+    "after",
+    `
+${pc.bold("Examples:")}
+  ${pc.dim("$")} sauce-control                        ${pc.dim("# guided wizard (org → repo → branch)")}
+  ${pc.dim("$")} sauce-control repos my-org
+  ${pc.dim("$")} sauce-control up my-org/web -b main   ${pc.dim("# record + launch in one go")}
+  ${pc.dim("$")} sauce-control launch <sessionId>
+  ${pc.dim("$")} sauce-control sessions
+
+Run with no arguments to launch the interactive wizard.`
+  );
 
 program
   .command("repos")
@@ -130,7 +143,7 @@ async function wizard(): Promise<void> {
   const org = await p.text({
     message: "GitHub org (or user)",
     placeholder: "my-org",
-    validate: (v) => (v.trim() ? undefined : "required"),
+    validate: (v) => (v?.trim() ? undefined : "required"),
   });
   if (p.isCancel(org)) return void p.cancel("Cancelled");
 
@@ -139,27 +152,39 @@ async function wizard(): Promise<void> {
   const repos = await listOrgRepos(org.trim());
   spin.stop(`${repos.length} repos`);
 
-  const repoPick = await p.select({
+  // autocomplete = searchable list, so a long repo/branch list is fully reachable
+  // by typing to filter rather than scrolling a windowed select.
+  const repo = await p.autocomplete<string>({
     message: "Repository",
+    placeholder: "type to filter…",
+    maxItems: 12,
     options: repos
       .filter((r) => !r.archived)
-      .map((r) => ({ value: r.name, label: r.name, hint: r.defaultBranch })),
+      .map((r) => ({
+        value: r.name,
+        label: r.name,
+        hint: r.private ? `${r.defaultBranch} · private` : r.defaultBranch,
+      })),
   });
-  if (p.isCancel(repoPick)) return void p.cancel("Cancelled");
-  const repo = repoPick as string;
+  if (p.isCancel(repo)) return void p.cancel("Cancelled");
 
   spin.start("Fetching branches");
   const branches = await listBranches(org.trim(), repo);
   spin.stop(`${branches.length} branches`);
 
   const def = repos.find((r) => r.name === repo)?.defaultBranch;
-  const branchPick = await p.select({
+  const branch = await p.autocomplete<string>({
     message: "Branch",
+    placeholder: "type to filter…",
+    maxItems: 12,
     initialValue: def,
-    options: branches.map((b) => ({ value: b, label: b })),
+    options: branches.map((b) => ({
+      value: b,
+      label: b,
+      hint: b === def ? "default" : undefined,
+    })),
   });
-  if (p.isCancel(branchPick)) return void p.cancel("Cancelled");
-  const branch = branchPick as string;
+  if (p.isCancel(branch)) return void p.cancel("Cancelled");
 
   const action = await p.select({
     message: "Action",
@@ -170,6 +195,11 @@ async function wizard(): Promise<void> {
   });
   if (p.isCancel(action)) return void p.cancel("Cancelled");
 
+  p.note(
+    `${pc.bold(`${org.trim()}/${repo}`)} @ ${pc.cyan(branch)}\n` +
+      `${action === "up" ? "Record, then launch mocked" : "Record only"}`,
+    "Plan"
+  );
   p.outro("Starting…");
   const session = await prepare({ org: org.trim(), repo, branch });
   await recordSession(session);

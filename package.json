@@ -20,7 +20,7 @@
     "prepare": "husky"
   },
   "dependencies": {
-    "@clack/prompts": "^0.7.0",
+    "@clack/prompts": "^1.7.0",
     "@octokit/rest": "^21.0.2",
     "commander": "^12.1.0",
     "jose": "^5.9.6",
