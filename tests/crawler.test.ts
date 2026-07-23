@@ -45,6 +45,26 @@ describe("checkUrl", () => {
     expect(checkUrl(`${ORIGIN}/dashboard`, ORIGIN).safe).toBe(true);
     expect(checkUrl(`${ORIGIN}/orders/archived`, ORIGIN).safe).toBe(true);
   });
+  it("rejects auth plumbing (replaying an OAuth callback kills the session)", () => {
+    for (const p of [
+      "/callback?code=abc&state=xyz",
+      "/api/auth/callback/auth0",
+      "/?code=abc&state=xyz",
+      "/login",
+      "/sign-in",
+      "/signup",
+      "/oauth/token",
+      "/authorize",
+    ]) {
+      const v = checkUrl(`${ORIGIN}${p}`, ORIGIN);
+      expect(v.safe, p).toBe(false);
+      expect(v.reason, p).toBe("auth plumbing");
+    }
+    // Segment-bounded: these are ordinary app routes.
+    for (const p of ["/plugin", "/calling", "/blog/authorized"]) {
+      expect(checkUrl(`${ORIGIN}${p}`, ORIGIN).safe, p).toBe(true);
+    }
+  });
 });
 
 describe("routeShape", () => {

@@ -13,6 +13,14 @@
 export const UNSAFE_PATTERN =
   /log[\s_-]?(out|off)|sign[\s_-]?(out|off)|end[\s_-]?session|delete|remove|destroy|unsubscribe|deactivate|cancel[\s_-]?(account|subscription|plan)|revoke|archive(?!d)/i;
 
+/**
+ * Auth-flow plumbing that must never be crawled: revisiting an OAuth
+ * callback replays a consumed authorization code, which kills the live
+ * session and bounces every later visit through the login redirect.
+ */
+export const AUTH_PLUMBING_PATTERN =
+  /(^|\/)(callback|oauth2?|authorize|log[_-]?in|sign[_-]?in|sign[_-]?up|register)(\/|$)/i;
+
 /** Canonical form for dedup: absolute, no hash, sorted query, no trailing slash. */
 export function normalizeUrl(raw: string, base: string): string | null {
   let u: URL;
@@ -52,6 +60,11 @@ export function checkUrl(
   // Path AND query — logout often hides in "?action=logout" etc.
   if (UNSAFE_PATTERN.test(u.pathname + u.search))
     return { safe: false, reason: "destructive-looking URL" };
+  if (
+    AUTH_PLUMBING_PATTERN.test(u.pathname) ||
+    (u.searchParams.has("code") && u.searchParams.has("state"))
+  )
+    return { safe: false, reason: "auth plumbing" };
   return { safe: true };
 }
 
@@ -152,8 +165,10 @@ export async function crawl(
     const verdict = checkUrl(url, origin, avoidHosts);
     if (!verdict.safe) {
       // Off-origin links are everyday noise; only surface interesting skips.
-      if (verdict.reason !== "off-origin")
+      if (verdict.reason !== "off-origin") {
         result.skipped.push({ url, reason: verdict.reason! });
+        log(`skipping ${url} (${verdict.reason})`);
+      }
       return;
     }
     queue.push(url);

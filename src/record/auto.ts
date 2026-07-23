@@ -1,6 +1,11 @@
 import fs from "node:fs";
 import type { BrowserContext, Page } from "playwright";
-import { crawl, type PageDriver } from "./crawler.js";
+import {
+  AUTH_PLUMBING_PATTERN,
+  crawl,
+  routeShape,
+  type PageDriver,
+} from "./crawler.js";
 import { exploreStep, type ExplorePage } from "./explorer.js";
 import {
   createLocalLlmPolicy,
@@ -25,6 +30,12 @@ export interface AutoOptions {
   allowMutations?: boolean;
   maxPages?: number;
   shouldStop?: () => boolean;
+  /**
+   * Wait for Enter in the terminal before exploring (default when stdin is a
+   * TTY). Guessing "the user is done logging in" from page quiescence starts
+   * the crawl mid-login and fights the user for the browser.
+   */
+  confirmStart?: boolean;
 }
 
 /**
@@ -81,6 +92,42 @@ async function waitForLogin(
   return true;
 }
 
+/** Resolve on Enter in the terminal (or when shouldStop turns true). */
+function waitForEnter(shouldStop: () => boolean): Promise<void> {
+  return new Promise((resolve) => {
+    let iv: NodeJS.Timeout;
+    const done = () => {
+      clearInterval(iv);
+      process.stdin.off("data", done);
+      process.stdin.pause();
+      resolve();
+    };
+    iv = setInterval(() => {
+      if (shouldStop()) done();
+    }, 500);
+    process.stdin.resume();
+    process.stdin.once("data", done);
+  });
+}
+
+/**
+ * Dev-tool overlays (TanStack Router/Query devtools, Next.js dev overlay)
+ * are not app UI: Router devtools renders the whole route tree — logout
+ * included — as clickable rows that navigate with no href to inspect.
+ * Anything inside these containers is invisible to the crawler and the AI.
+ */
+const DEVTOOLS_EXCLUDE = [
+  '[class*="TanStack"]',
+  '[id*="TanStack"]',
+  '[class*="tsqd"]', // TanStack Query devtools
+  '[id*="tsqd"]',
+  '[class*="tsrd"]', // TanStack Router devtools
+  '[class*="devtools" i]',
+  '[id*="devtools" i]',
+  "tanstack-devtools",
+  "nextjs-portal",
+].join(",");
+
 async function settle(page: Page): Promise<void> {
   await page
     .waitForLoadState("networkidle", { timeout: 7_000 })
@@ -97,14 +144,22 @@ function makeDriver(
     async visit(url) {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15_000 });
       await settle(page);
-      if (!page.url().startsWith(origin)) {
-        throw new Error(`redirected off-origin to ${page.url()} (logged out?)`);
+      const landed = page.url();
+      if (!landed.startsWith(origin)) {
+        throw new Error(`redirected off-origin to ${landed} (logged out?)`);
+      }
+      const requested = new URL(url).pathname;
+      const got = new URL(landed).pathname;
+      if (got !== requested && AUTH_PLUMBING_PATTERN.test(got)) {
+        throw new Error(`bounced to ${got} (session logged out?)`);
       }
     },
     async collectLinks() {
       const hrefs = (await page
         .evaluate(
-          `Array.from(document.querySelectorAll("a[href]")).map((a) => a.href)`
+          `Array.from(document.querySelectorAll("a[href]"))
+            .filter((a) => !a.closest(${JSON.stringify(DEVTOOLS_EXCLUDE)}))
+            .map((a) => a.href)`
         )
         .catch(() => [])) as string[];
       return [...hrefs, ...navBuffer.splice(0)];
@@ -135,6 +190,7 @@ const CANDIDATES_SCRIPT = `(() => {
   for (const el of els) {
     if (cands.length >= 40) break;
     if (el.disabled || el.closest("[hidden]")) continue;
+    if (el.closest(${JSON.stringify(DEVTOOLS_EXCLUDE)})) continue;
     const r = el.getBoundingClientRect();
     if (r.width === 0 && r.height === 0) continue;
     const tag = el.tagName.toLowerCase();
@@ -208,11 +264,22 @@ export async function runAuto(args: {
   const origin = `http://localhost:${session.appPort}`;
   const shouldStop = opts.shouldStop ?? (() => false);
 
-  log.step(
-    "Auto-explore armed — log in if prompted; crawling starts once the app settles."
-  );
-  if (!(await waitForLogin(page, origin))) return;
+  const gateOnEnter = opts.confirmStart ?? process.stdin.isTTY === true;
+  if (gateOnEnter) {
+    log.step(
+      "Log in in the browser if needed, then press Enter here to start auto-exploring."
+    );
+    await waitForEnter(shouldStop);
+  } else {
+    log.step(
+      "Auto-explore armed — log in if prompted; crawling starts once the app settles."
+    );
+    if (!(await waitForLogin(page, origin))) return;
+  }
   if (shouldStop()) return;
+  // Drop navigations captured during login — the OAuth callback URL is in
+  // here, and revisiting a consumed authorization code kills the session.
+  navBuffer.length = 0;
 
   const { routes, dynamic } = enumerateStaticRoutes(session.worktree);
   if (routes.length > 0) {
@@ -243,8 +310,15 @@ export async function runAuto(args: {
   const explorePage = makeExplorePage(page);
   let policyFailures = 0;
 
+  // One AI pass per route shape: /orders?q=a and /orders?q=b present the
+  // same UI, and re-exploring it just re-runs the same actions.
+  const exploredShapes = new Set<string>();
+
   const onPage = async (url: string): Promise<string[] | void> => {
     if (!policy || policyFailures >= 3) return;
+    const shape = routeShape(url);
+    if (exploredShapes.has(shape)) return;
+    exploredShapes.add(shape);
     let failed = false;
     const res = await exploreStep(explorePage, {
       policy,
