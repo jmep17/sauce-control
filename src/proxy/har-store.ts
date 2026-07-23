@@ -122,7 +122,25 @@ export class HarStore {
     };
   }
 
-  /** Append a freshly captured response and persist to disk. */
+  /** Number of entries currently held. */
+  get size(): number {
+    return this.har.log.entries.length;
+  }
+
+  /** Unique "METHOD /path" pairs captured — coverage summary for auto-explore. */
+  endpoints(): string[] {
+    const out = new Set<string>();
+    for (const e of this.har.log.entries) {
+      const { path } = normalizePath(e.request.url);
+      out.add(`${e.request.method.toUpperCase()} ${path}`);
+    }
+    return [...out];
+  }
+
+  /**
+   * Append a freshly captured response. Persists to disk unless
+   * `opts.persist` is false (bulk recording batches writes via `flush()`).
+   */
   append(
     method: string,
     url: string,
@@ -130,7 +148,8 @@ export class HarStore {
     headers: Record<string, string>,
     body: Buffer,
     reqHeaders: Record<string, string> = {},
-    reqBody?: string
+    reqBody?: string,
+    opts: { persist?: boolean } = {}
   ): void {
     const isText = /json|text|xml|javascript|urlencoded/i.test(
       headers["content-type"] ?? ""
@@ -163,6 +182,11 @@ export class HarStore {
     };
     this.har.log.entries.push(entry);
     this.index(entry);
+    if (opts.persist !== false) this.persist();
+  }
+
+  /** Write the current state to disk. */
+  flush(): void {
     this.persist();
   }
 

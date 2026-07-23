@@ -45,6 +45,8 @@ const META = "session.json";
 export const HAR_FILE = "traffic.har";
 export const KEY_FILE = "signing-key.json";
 export const CERT_DIR = "ca";
+/** AI-explorer decision log (JSONL) — doubles as a fine-tuning dataset. */
+export const DECISIONS_FILE = "decisions.jsonl";
 
 export function sessionPaths(id: string) {
   const dir = sessionDir(id);
@@ -54,6 +56,7 @@ export function sessionPaths(id: string) {
     har: path.join(dir, HAR_FILE),
     key: path.join(dir, KEY_FILE),
     certDir: path.join(dir, CERT_DIR),
+    decisions: path.join(dir, DECISIONS_FILE),
   };
 }
 

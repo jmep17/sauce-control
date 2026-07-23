@@ -38,7 +38,10 @@ prepare → record → (serve + patch) → launch
   the branch (`worktree/checkout.ts`) → install deps → detect framework + discover env vars
   (`detect/`) → save session. Shared by `record` and `up`.
 - **`record`** (`record/recorder.ts`): runs the app's dev server **unpatched** (real
-  backend + Auth0) and captures all traffic via Playwright `routeFromHAR({ update:true })`.
+  backend + Auth0) and captures all traffic via `context.on("response")` into the
+  session HAR (`record/har-recorder.ts`), persisted incrementally — never via
+  `routeFromHAR({ update: true })`, which loses the HAR unless the context closes
+  gracefully. `--auto [crawl|ai]` auto-explores after login (`record/auto.ts`).
 - **`launch`** (`launch/launcher.ts`): starts the proxy, patches the worktree env to point
   at it, runs the dev server against it. `up` = prepare + record + launch.
 
@@ -72,7 +75,23 @@ wizard when invoked with no args).
   `WORKTREES_DIR`.
 
 - **Playwright is a lazy peer dep.** `recorder.ts` imports it via dynamic `import()`, and
-  tsup marks it `external` — never import it at module top level.
+  tsup marks it `external` — never import it at module top level (`import type` is fine;
+  `record/auto.ts` relies on that).
+
+- **Auto-explore is layered: pure engines + thin Playwright glue.** `record/crawler.ts`
+  (BFS, URL safety, route-shape caps) and `record/explorer.ts` (per-page AI step) are
+  playwright-free and unit-tested against fakes; `record/auto.ts` adapts a real Page and
+  composes them with static route enumeration (`detect/routes.ts`) and pushState capture.
+  The LLM (`llm/policy.ts`) is **policy, not authority**: it picks from a candidate menu
+  the tool built, and every proposal re-passes in-code checks (`UNSAFE_PATTERN`, GET-only
+  form gating) — model output must never gain a capability code didn't already allow.
+
+- **Local-LLM quirks are handled in `llm/policy.ts` — keep them there.** Requests go to
+  Ollama natively with `think: false` (reasoning models otherwise take minutes per
+  decision; retried without the field for models that reject it). Ollama 0.31 silently
+  drops the `format` schema constraint when `think: false`, so the schema is also shown
+  in the prompt and `parseDecision` is strict, with one corrective retry on shape
+  mismatch. AI decisions append to `sessions/<id>/decisions.jsonl` (a future SFT set).
 
 ## Conventions
 

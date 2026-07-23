@@ -3,7 +3,7 @@ import * as p from "@clack/prompts";
 import pc from "picocolors";
 import { listOrgRepos, listBranches } from "./github/repos.js";
 import { prepare } from "./commands/prepare.js";
-import { recordSession } from "./record/recorder.js";
+import { recordSession, type RecordOptions } from "./record/recorder.js";
 import { launchMocked } from "./launch/launcher.js";
 import { startProxy } from "./proxy/server.js";
 import { loadSession, listSessions, saveSession } from "./session/store.js";
@@ -15,6 +15,50 @@ function parseSlug(slug: string): { org: string; repo: string } {
   if (!org || !repo)
     throw new UserError(`Expected <org>/<repo>, got '${slug}'`);
   return { org, repo };
+}
+
+interface RecordCliOpts {
+  branch?: string;
+  skipInstall?: boolean;
+  auto?: string | boolean;
+  llmUrl?: string;
+  llmModel?: string;
+  allowMutations?: boolean;
+  maxPages?: string;
+}
+
+function toRecordOptions(opts: RecordCliOpts): RecordOptions {
+  if (opts.auto === undefined) return {};
+  const mode = opts.auto === true ? "crawl" : opts.auto;
+  if (mode !== "crawl" && mode !== "ai")
+    throw new UserError(
+      `--auto expects 'crawl' or 'ai', got '${String(mode)}'`
+    );
+  return {
+    auto: mode,
+    ...(opts.llmUrl !== undefined ? { llmUrl: opts.llmUrl } : {}),
+    ...(opts.llmModel !== undefined ? { llmModel: opts.llmModel } : {}),
+    ...(opts.allowMutations ? { allowMutations: true } : {}),
+    ...(opts.maxPages !== undefined ? { maxPages: Number(opts.maxPages) } : {}),
+  };
+}
+
+function addRecordFlags(cmd: Command): Command {
+  return cmd
+    .option(
+      "--auto [mode]",
+      "auto-explore after login: 'crawl' (link BFS, default) or 'ai' (crawl + local LLM)"
+    )
+    .option(
+      "--llm-url <url>",
+      "LLM endpoint for --auto ai (default: local Ollama, http://localhost:11434)"
+    )
+    .option(
+      "--llm-model <model>",
+      "model for --auto ai (default: auto-detected from installed models)"
+    )
+    .option("--allow-mutations", "let --auto ai submit non-search (POST) forms")
+    .option("--max-pages <n>", "auto-explore page cap (default 50)");
 }
 
 const program = new Command();
@@ -56,25 +100,24 @@ program
     log.info(`${repos.length} repos`);
   });
 
-program
-  .command("record")
-  .argument("<slug>", "<org>/<repo>")
-  .option("-b, --branch <branch>", "branch to check out")
-  .option("--skip-install", "skip dependency install")
-  .description("Clone a worktree and record real network traffic to a HAR")
-  .action(
-    async (slug: string, opts: { branch?: string; skipInstall?: boolean }) => {
-      const { org, repo } = parseSlug(slug);
-      const session = await prepare({
-        org,
-        repo,
-        branch: opts.branch,
-        skipInstall: opts.skipInstall,
-      });
-      await recordSession(session);
-      log.info(`Next: ${pc.cyan(`sauce-control launch ${session.id}`)}`);
-    }
-  );
+addRecordFlags(
+  program
+    .command("record")
+    .argument("<slug>", "<org>/<repo>")
+    .option("-b, --branch <branch>", "branch to check out")
+    .option("--skip-install", "skip dependency install")
+    .description("Clone a worktree and record real network traffic to a HAR")
+).action(async (slug: string, opts: RecordCliOpts) => {
+  const { org, repo } = parseSlug(slug);
+  const session = await prepare({
+    org,
+    repo,
+    branch: opts.branch,
+    skipInstall: opts.skipInstall,
+  });
+  await recordSession(session, toRecordOptions(opts));
+  log.info(`Next: ${pc.cyan(`sauce-control launch ${session.id}`)}`);
+});
 
 program
   .command("serve")
@@ -100,25 +143,24 @@ program
     await launchMocked(loadSession(sessionId));
   });
 
-program
-  .command("up")
-  .argument("<slug>", "<org>/<repo>")
-  .option("-b, --branch <branch>", "branch to check out")
-  .option("--skip-install", "skip dependency install")
-  .description("Full flow: prepare → record → launch mocked")
-  .action(
-    async (slug: string, opts: { branch?: string; skipInstall?: boolean }) => {
-      const { org, repo } = parseSlug(slug);
-      const session = await prepare({
-        org,
-        repo,
-        branch: opts.branch,
-        skipInstall: opts.skipInstall,
-      });
-      await recordSession(session);
-      await launchMocked(session);
-    }
-  );
+addRecordFlags(
+  program
+    .command("up")
+    .argument("<slug>", "<org>/<repo>")
+    .option("-b, --branch <branch>", "branch to check out")
+    .option("--skip-install", "skip dependency install")
+    .description("Full flow: prepare → record → launch mocked")
+).action(async (slug: string, opts: RecordCliOpts) => {
+  const { org, repo } = parseSlug(slug);
+  const session = await prepare({
+    org,
+    repo,
+    branch: opts.branch,
+    skipInstall: opts.skipInstall,
+  });
+  await recordSession(session, toRecordOptions(opts));
+  await launchMocked(session);
+});
 
 program
   .command("sessions")
@@ -195,14 +237,36 @@ async function wizard(): Promise<void> {
   });
   if (p.isCancel(action)) return void p.cancel("Cancelled");
 
+  const auto = await p.select({
+    message: "Auto-explore after login?",
+    options: [
+      {
+        value: "crawl",
+        label: "Crawl",
+        hint: "visit every route automatically",
+      },
+      {
+        value: "ai",
+        label: "Crawl + AI",
+        hint: "local LLM clicks tabs/filters too (Ollama)",
+      },
+      { value: "off", label: "Off", hint: "record only what you click" },
+    ],
+  });
+  if (p.isCancel(auto)) return void p.cancel("Cancelled");
+
   p.note(
     `${pc.bold(`${org.trim()}/${repo}`)} @ ${pc.cyan(branch)}\n` +
-      `${action === "up" ? "Record, then launch mocked" : "Record only"}`,
+      `${action === "up" ? "Record, then launch mocked" : "Record only"}` +
+      `${auto === "off" ? "" : ` · auto-explore: ${auto}`}`,
     "Plan"
   );
   p.outro("Starting…");
   const session = await prepare({ org: org.trim(), repo, branch });
-  await recordSession(session);
+  await recordSession(
+    session,
+    auto === "off" ? {} : { auto: auto as "crawl" | "ai" }
+  );
   if (action === "up") await launchMocked(session);
   else log.info(`Next: ${pc.cyan(`sauce-control launch ${session.id}`)}`);
 }
