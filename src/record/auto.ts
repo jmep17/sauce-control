@@ -88,11 +88,18 @@ async function settle(page: Page): Promise<void> {
   await new Promise((r) => setTimeout(r, 250));
 }
 
-function makeDriver(page: Page, navBuffer: string[]): PageDriver {
+function makeDriver(
+  page: Page,
+  navBuffer: string[],
+  origin: string
+): PageDriver {
   return {
     async visit(url) {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15_000 });
       await settle(page);
+      if (!page.url().startsWith(origin)) {
+        throw new Error(`redirected off-origin to ${page.url()} (logged out?)`);
+      }
     },
     async collectLinks() {
       const hrefs = (await page
@@ -245,6 +252,7 @@ export async function runAuto(args: {
       coverage: () => ({ requests: store.size, endpoints: store.endpoints() }),
       logDecision: (record) =>
         fs.appendFileSync(decisions, JSON.stringify(record) + "\n"),
+      narrate: (msg) => log.dim(`    ${msg}`),
       warn: (msg) => {
         failed = true;
         log.warn(msg);
@@ -260,7 +268,7 @@ export async function runAuto(args: {
     return res.discovered;
   };
 
-  const result = await crawl(makeDriver(page, navBuffer), {
+  const result = await crawl(makeDriver(page, navBuffer, origin), {
     origin,
     seeds: [origin, ...routes.map((r) => origin + r)],
     avoidHosts: auth0Hosts(session),
@@ -279,6 +287,14 @@ export async function runAuto(args: {
   if (result.outOfBudget) {
     log.warn(
       "Stopped at the time budget; rerun with --max-pages to go deeper."
+    );
+  }
+  if (result.abortedReason) {
+    log.warn(`Auto-explore aborted: ${result.abortedReason}`);
+  }
+  if (policy) {
+    log.info(
+      `AI decision log: ${sessionPaths(session.id).decisions} (one JSON line per page: what it saw, chose, and what was blocked)`
     );
   }
 }

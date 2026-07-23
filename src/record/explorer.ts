@@ -37,6 +37,8 @@ export interface ExplorerOptions {
   /** Appends one JSON-serializable record to decisions.jsonl. */
   logDecision?: (record: object) => void;
   warn?: (msg: string) => void;
+  /** Live one-liner per attempted action — the AI's visible reasoning trail. */
+  narrate?: (msg: string) => void;
 }
 
 interface ExecutedAction {
@@ -58,12 +60,15 @@ const SAFE_INPUT_TYPES = new Set([
   "",
 ]);
 
-function isSafeCandidate(c: Candidate): boolean {
-  if (UNSAFE_PATTERN.test(c.text)) return false;
-  if (c.href && UNSAFE_PATTERN.test(c.href)) return false;
+function unsafeReason(c: Candidate): string | null {
+  // Unlabeled elements (icon-only buttons with no accessible name) are
+  // unknowable — one of them may well be the logout button.
+  if (!c.text.trim()) return "unlabeled element";
+  if (UNSAFE_PATTERN.test(c.text)) return "destructive-looking label";
+  if (c.href && UNSAFE_PATTERN.test(c.href)) return "destructive-looking href";
   if (c.kind === "input" && !SAFE_INPUT_TYPES.has(c.inputType ?? ""))
-    return false;
-  return true;
+    return `unsafe input type (${c.inputType})`;
+  return null;
 }
 
 function submitAllowed(c: Candidate, allowMutations: boolean): boolean {
@@ -93,6 +98,7 @@ export async function exploreStep(
     coverage,
     logDecision = () => {},
     warn = () => {},
+    narrate = () => {},
   } = opts;
 
   const pageUrl = page.url();
@@ -117,6 +123,17 @@ export async function exploreStep(
   }
 
   const byId = new Map(candidates.map((c) => [c.id, c]));
+  // The model's own avoid-list binds it: some models list an element in both
+  // actions and avoid — avoid wins.
+  const avoided = new Set(decision.avoid.map((a) => a.id));
+  const finish = (record: ExecutedAction, cand: Candidate | undefined) => {
+    const label = cand
+      ? JSON.stringify(cand.text.slice(0, 40))
+      : `#${record.id}`;
+    narrate(
+      `ai: ${record.kind} ${label}${record.value !== undefined ? `=${JSON.stringify(record.value)}` : ""} → ${record.outcome}${record.detail ? ` (${record.detail})` : ""}`
+    );
+  };
   for (const action of decision.actions.slice(0, maxActionsPerPage)) {
     const cand = byId.get(action.id);
     const record: ExecutedAction = {
@@ -130,12 +147,21 @@ export async function exploreStep(
     if (!cand) {
       record.outcome = "blocked";
       record.detail = "unknown candidate id";
+      finish(record, cand);
       continue;
     }
     // The hard floor: the model's verdict never overrides these.
-    if (!isSafeCandidate(cand)) {
+    const unsafe = unsafeReason(cand);
+    if (unsafe) {
       record.outcome = "blocked";
-      record.detail = "unsafe candidate";
+      record.detail = unsafe;
+      finish(record, cand);
+      continue;
+    }
+    if (avoided.has(action.id)) {
+      record.outcome = "blocked";
+      record.detail = "model also marked it avoid";
+      finish(record, cand);
       continue;
     }
     if (
@@ -144,11 +170,13 @@ export async function exploreStep(
     ) {
       record.outcome = "blocked";
       record.detail = "not fillable";
+      finish(record, cand);
       continue;
     }
     if (action.kind === "fill_submit" && !submitAllowed(cand, allowMutations)) {
       record.outcome = "blocked";
       record.detail = "non-GET form submit (use --allow-mutations)";
+      finish(record, cand);
       continue;
     }
 
@@ -162,13 +190,19 @@ export async function exploreStep(
       // Give the app a beat, then recover if the action navigated away.
       const nowUrl = page.url();
       if (nowUrl !== pageUrl) {
-        result.discovered.push(nowUrl);
+        if (!nowUrl.startsWith(new URL(pageUrl).origin)) {
+          // Landed off the app entirely (auth redirect?) — don't feed it back.
+          record.detail = "navigated off-origin (recovered)";
+        } else {
+          result.discovered.push(nowUrl);
+        }
         await page.returnTo(pageUrl);
       }
     } catch (err) {
       record.outcome = "error";
       record.detail = (err as Error).message.slice(0, 200);
     }
+    finish(record, cand);
   }
 
   logDecision({

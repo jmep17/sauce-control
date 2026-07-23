@@ -11,7 +11,7 @@
  * common filter/tab label and must stay clickable.
  */
 export const UNSAFE_PATTERN =
-  /log[\s_-]?out|sign[\s_-]?out|delete|remove|destroy|unsubscribe|deactivate|cancel[\s_-]?(account|subscription|plan)|revoke|archive(?!d)/i;
+  /log[\s_-]?(out|off)|sign[\s_-]?(out|off)|end[\s_-]?session|delete|remove|destroy|unsubscribe|deactivate|cancel[\s_-]?(account|subscription|plan)|revoke|archive(?!d)/i;
 
 /** Canonical form for dedup: absolute, no hash, sorted query, no trailing slash. */
 export function normalizeUrl(raw: string, base: string): string | null {
@@ -49,8 +49,9 @@ export function checkUrl(
   }
   if (u.origin !== origin) return { safe: false, reason: "off-origin" };
   if (avoidHosts.includes(u.host)) return { safe: false, reason: "auth host" };
-  if (UNSAFE_PATTERN.test(u.pathname))
-    return { safe: false, reason: "destructive-looking path" };
+  // Path AND query — logout often hides in "?action=logout" etc.
+  if (UNSAFE_PATTERN.test(u.pathname + u.search))
+    return { safe: false, reason: "destructive-looking URL" };
   return { safe: true };
 }
 
@@ -113,7 +114,12 @@ export interface CrawlResult {
   visited: string[];
   skipped: { url: string; reason: string }[];
   outOfBudget: boolean;
+  /** Set when the crawl bailed out (e.g. every visit started failing). */
+  abortedReason?: string;
 }
+
+/** Consecutive visit failures before the crawl gives up (session likely dead). */
+const MAX_CONSECUTIVE_ERRORS = 5;
 
 export async function crawl(
   driver: PageDriver,
@@ -133,6 +139,7 @@ export async function crawl(
   } = opts;
 
   const deadline = now() + timeBudgetMs;
+  let consecutiveErrors = 0;
   const queue: string[] = [];
   const enqueued = new Set<string>();
   const shapeCount = new Map<string, number>();
@@ -172,6 +179,7 @@ export async function crawl(
     log(`visiting ${url}`);
     try {
       await driver.visit(url);
+      consecutiveErrors = 0;
       result.visited.push(url);
       for (const link of await driver.collectLinks()) enqueue(link);
       if (onPage) {
@@ -180,6 +188,10 @@ export async function crawl(
       }
     } catch (err) {
       result.skipped.push({ url, reason: `error: ${(err as Error).message}` });
+      if (++consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+        result.abortedReason = `${MAX_CONSECUTIVE_ERRORS} visits failed in a row (session logged out?)`;
+        break;
+      }
     }
   }
   return result;

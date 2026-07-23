@@ -76,6 +76,58 @@ describe("exploreStep", () => {
     expect(logged).toHaveLength(1);
   });
 
+  it("blocks unlabeled elements, avoid-listed ids, and log-off variants", async () => {
+    const { page, calls } = fakePage([
+      cand({ id: 0, text: "" }), // icon-only button — could be anything
+      cand({ id: 1, text: "Log Off" }),
+      cand({ id: 2, text: "Refresh" }),
+      cand({ id: 3, kind: "tab", text: "Activity" }),
+    ]);
+    const result = await exploreStep(page, {
+      policy: policyOf({
+        actions: [
+          { id: 0, kind: "click" },
+          { id: 1, kind: "click" },
+          { id: 2, kind: "click" },
+          { id: 3, kind: "click" },
+        ],
+        // Model contradicts itself: proposes #2 while also avoiding it.
+        avoid: [{ id: 2, reason: "not sure" }],
+      }),
+      coverage: () => ({ requests: 0, endpoints: [] }),
+    });
+    expect(calls).toEqual(["click:3"]);
+    expect(result.executed.map((e) => [e.id, e.outcome])).toEqual([
+      [0, "blocked"],
+      [1, "blocked"],
+      [2, "blocked"],
+      [3, "ok"],
+    ]);
+  });
+
+  it("narrates each attempted action", async () => {
+    const { page } = fakePage([
+      cand({ id: 0, kind: "tab", text: "Activity" }),
+      cand({ id: 1, text: "Sign out" }),
+    ]);
+    const lines: string[] = [];
+    await exploreStep(page, {
+      policy: policyOf({
+        actions: [
+          { id: 0, kind: "click" },
+          { id: 1, kind: "click" },
+        ],
+        avoid: [],
+      }),
+      coverage: () => ({ requests: 0, endpoints: [] }),
+      narrate: (m) => lines.push(m),
+    });
+    expect(lines[0]).toContain('"Activity"');
+    expect(lines[0]).toContain("ok");
+    expect(lines[1]).toContain("blocked");
+    expect(lines[1]).toContain("destructive-looking label");
+  });
+
   it('treats "Archived" as a safe filter label but "Archive" as mutating', async () => {
     const { page, calls } = fakePage([
       cand({ id: 0, kind: "tab", text: "Archived" }),

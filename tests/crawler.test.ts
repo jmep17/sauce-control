@@ -31,11 +31,19 @@ describe("checkUrl", () => {
       ]).safe
     ).toBe(false);
   });
-  it("rejects destructive-looking paths", () => {
-    for (const p of ["/logout", "/sign-out", "/items/3/delete"]) {
+  it("rejects destructive-looking paths and query strings", () => {
+    for (const p of [
+      "/logout",
+      "/sign-out",
+      "/logoff",
+      "/items/3/delete",
+      "/?action=logout",
+      "/account?do=signout",
+    ]) {
       expect(checkUrl(`${ORIGIN}${p}`, ORIGIN).safe).toBe(false);
     }
     expect(checkUrl(`${ORIGIN}/dashboard`, ORIGIN).safe).toBe(true);
+    expect(checkUrl(`${ORIGIN}/orders/archived`, ORIGIN).safe).toBe(true);
   });
 });
 
@@ -82,7 +90,7 @@ describe("crawl", () => {
     expect(visits).toEqual([`${ORIGIN}/`, `${ORIGIN}/a`, `${ORIGIN}/b`]);
     expect(result.visited).toHaveLength(3);
     expect(result.skipped).toEqual([
-      { url: `${ORIGIN}/logout`, reason: "destructive-looking path" },
+      { url: `${ORIGIN}/logout`, reason: "destructive-looking URL" },
     ]);
   });
 
@@ -137,6 +145,19 @@ describe("crawl", () => {
         url === `${ORIGIN}/` ? [`${ORIGIN}/from-ai`] : [],
     });
     expect(visits).toContain(`${ORIGIN}/from-ai`);
+  });
+
+  it("aborts after repeated consecutive visit failures (dead session)", async () => {
+    const seeds = Array.from({ length: 10 }, (_, i) => `${ORIGIN}/p${i}`);
+    const dead: PageDriver = {
+      visit: async () => {
+        throw new Error("redirected off-origin (logged out?)");
+      },
+      collectLinks: async () => [],
+    };
+    const result = await crawl(dead, { origin: ORIGIN, seeds });
+    expect(result.abortedReason).toContain("logged out");
+    expect(result.skipped).toHaveLength(5); // stopped, not the full queue
   });
 
   it("a visit error skips the page but continues the crawl", async () => {
