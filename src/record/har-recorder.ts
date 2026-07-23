@@ -20,6 +20,22 @@ interface ResponseSource {
   on(event: "response", cb: (response: RecordedResponse) => void): unknown;
 }
 
+export interface HarRecorderOptions {
+  debounceMs?: number;
+  /**
+   * The app's own origins: only their JSON responses are recorded. The dev
+   * server serves its own pages/chunks/HMR during mocked launch, and dev-mode
+   * assets are enormous (unminified chunks, sourcemaps) — recording them
+   * ballooned HARs past JSON.stringify's limits without adding anything
+   * replayable. JSON is kept because some setups proxy their API through the
+   * app origin (Vite dev proxy, Next /_next/data).
+   */
+  appOrigins?: string[];
+}
+
+/** Static/streaming content that's never useful to replay from the HAR. */
+const SKIP_CONTENT = /^(image|font|video|audio)\/|event-stream/i;
+
 /**
  * Capture every response on a browser context into the HAR store,
  * incrementally. Entries land on disk within `debounceMs` of arriving, so a
@@ -31,8 +47,9 @@ interface ResponseSource {
 export function attachHarRecorder(
   context: ResponseSource,
   store: HarStore,
-  debounceMs = 300
+  opts: HarRecorderOptions = {}
 ): { flush(): void } {
+  const { debounceMs = 300, appOrigins = [] } = opts;
   let timer: NodeJS.Timeout | undefined;
   const scheduleFlush = () => {
     clearTimeout(timer);
@@ -42,12 +59,21 @@ export function attachHarRecorder(
   context.on("response", (response) => {
     void (async () => {
       try {
+        const url = response.url();
+        const contentType = response.headers()["content-type"] ?? "";
+        // Check before body(): an event-stream body never resolves.
+        if (SKIP_CONTENT.test(contentType)) return;
+        if (
+          appOrigins.some((o) => url.startsWith(o)) &&
+          !/json/i.test(contentType)
+        )
+          return;
         // Redirects and aborted requests have no retrievable body.
         const body = await response.body().catch(() => Buffer.alloc(0));
         const req = response.request();
         store.append(
           req.method(),
-          response.url(),
+          url,
           response.status(),
           response.headers(),
           body,

@@ -26,6 +26,9 @@ function fakePage(
     fill: async (id, value) => {
       calls.push(`fill:${id}:${value}`);
     },
+    selectOption: async (id, label) => {
+      calls.push(`select:${id}:${label}`);
+    },
     pressEnter: async (id) => {
       calls.push(`enter:${id}`);
     },
@@ -232,6 +235,91 @@ describe("exploreStep", () => {
     expect(result.executed).toEqual([]);
     expect(calls).toEqual([]);
     expect(warnings[0]).toContain("connection refused");
+  });
+
+  it("selects dropdown options, but only on real selects with a value", async () => {
+    const { page, calls } = fakePage([
+      cand({
+        id: 0,
+        kind: "select",
+        text: "Choose a shop",
+        options: ["Shop A", "Shop B"],
+      }),
+      cand({ id: 1, text: "View details" }),
+    ]);
+    const result = await exploreStep(page, {
+      policy: policyOf({
+        actions: [
+          { id: 0, kind: "select", value: "Shop A" },
+          { id: 1, kind: "select", value: "nope" }, // not a dropdown
+          { id: 0, kind: "select" }, // no value
+        ],
+        avoid: [],
+      }),
+      coverage: () => ({ requests: 0, endpoints: [] }),
+    });
+    expect(calls).toEqual(["select:0:Shop A"]);
+    expect(result.executed.map((e) => e.outcome)).toEqual([
+      "ok",
+      "blocked",
+      "blocked",
+    ]);
+  });
+
+  it("retargets a select whose id is really an option index", async () => {
+    const { page, calls } = fakePage([
+      cand({
+        id: 0,
+        kind: "select",
+        text: "Choose a shop…",
+        options: ["Choose a shop…", "Alpha Shop", "Beta Shop"],
+      }),
+    ]);
+    await exploreStep(page, {
+      policy: policyOf({
+        // Model wrote the option index (1 = "Alpha Shop"), not the element id.
+        actions: [{ id: 1, kind: "select", value: "Alpha Shop" }],
+        avoid: [],
+      }),
+      coverage: () => ({ requests: 0, endpoints: [] }),
+    });
+    expect(calls).toEqual(["select:0:Alpha Shop"]);
+  });
+
+  it("gate-breaker: picks a dropdown option when the model produced nothing usable", async () => {
+    const shopSelect = cand({
+      id: 0,
+      kind: "select" as const,
+      text: "Choose a shop…",
+      options: ["Choose a shop…", "Alpha Shop", "Beta Shop"],
+    });
+    // Garbage decision (unknown id, wrong kind) → fallback selects "Alpha Shop".
+    const a = fakePage([shopSelect]);
+    const result = await exploreStep(a.page, {
+      policy: policyOf({ actions: [{ id: 7, kind: "click" }], avoid: [] }),
+      coverage: () => ({ requests: 0, endpoints: [] }),
+    });
+    expect(a.calls).toEqual(["select:0:Alpha Shop"]);
+    expect(result.executed.at(-1)).toMatchObject({
+      detail: "gate-breaker fallback",
+      outcome: "ok",
+    });
+
+    // A successful normal action → no fallback.
+    const b = fakePage([shopSelect, cand({ id: 1, kind: "tab", text: "Tab" })]);
+    await exploreStep(b.page, {
+      policy: policyOf({ actions: [{ id: 1, kind: "click" }], avoid: [] }),
+      coverage: () => ({ requests: 0, endpoints: [] }),
+    });
+    expect(b.calls).toEqual(["click:1"]);
+
+    // No dropdown on the page → no fallback.
+    const c = fakePage([cand({ id: 0, text: "View details" })]);
+    await exploreStep(c.page, {
+      policy: policyOf({ actions: [{ id: 9, kind: "click" }], avoid: [] }),
+      coverage: () => ({ requests: 0, endpoints: [] }),
+    });
+    expect(c.calls).toEqual([]);
   });
 
   it("caps actions per page", async () => {

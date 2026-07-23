@@ -71,9 +71,13 @@ export async function recordSession(
     // Nav capture must be installed before the first page exists.
     const navBuffer = opts.auto ? await installNavCapture(context) : [];
 
-    // Capture everything, persisted incrementally as responses arrive.
+    // Capture backend/Auth0 traffic, persisted incrementally as responses
+    // arrive. The app's own origin is excluded: during mocked launch the dev
+    // server serves its own pages/assets, and dev-mode chunks are huge.
     const store = new HarStore(har);
-    const recorder = attachHarRecorder(context, store);
+    const recorder = attachHarRecorder(context, store, {
+      appOrigins: [appUrl],
+    });
 
     let finished = false;
     const finishPromise = new Promise<void>((resolve) => {

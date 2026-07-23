@@ -1,4 +1,10 @@
 import fs from "node:fs";
+import { log } from "../util/log.js";
+
+/** Bodies above this are stored as metadata only — huge payloads are never
+ * API responses worth replaying, and they balloon the HAR toward
+ * JSON.stringify's string-length limit. */
+const MAX_BODY_BYTES = 2 * 1024 * 1024;
 
 // Minimal HAR typings covering what we read/write.
 interface HarHeader {
@@ -171,13 +177,20 @@ export class HarStore {
           name,
           value,
         })),
-        content: {
-          size: body.length,
-          mimeType: headers["content-type"] ?? "application/octet-stream",
-          ...(isText
-            ? { text: body.toString("utf8") }
-            : { text: body.toString("base64"), encoding: "base64" }),
-        },
+        content:
+          body.length > MAX_BODY_BYTES
+            ? {
+                size: body.length,
+                mimeType: headers["content-type"] ?? "application/octet-stream",
+                // text omitted: body exceeds MAX_BODY_BYTES
+              }
+            : {
+                size: body.length,
+                mimeType: headers["content-type"] ?? "application/octet-stream",
+                ...(isText
+                  ? { text: body.toString("utf8") }
+                  : { text: body.toString("base64"), encoding: "base64" }),
+              },
       },
     };
     this.har.log.entries.push(entry);
@@ -190,7 +203,21 @@ export class HarStore {
     this.persist();
   }
 
+  private persistFailed = false;
+
   private persist() {
-    fs.writeFileSync(this.harPath, JSON.stringify(this.har, null, 2));
+    // Compact JSON: pretty-printing doubles the file and stringify time.
+    // A persist failure must never crash the process (flush runs in a timer).
+    try {
+      fs.writeFileSync(this.harPath, JSON.stringify(this.har));
+      this.persistFailed = false;
+    } catch (err) {
+      if (!this.persistFailed) {
+        this.persistFailed = true;
+        log.warn(
+          `could not persist HAR (${(err as Error).message}) — recording continues in memory`
+        );
+      }
+    }
   }
 }

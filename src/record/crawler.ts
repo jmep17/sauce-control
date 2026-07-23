@@ -202,7 +202,14 @@ export async function crawl(
         for (const link of extra ?? []) enqueue(link);
       }
     } catch (err) {
-      result.skipped.push({ url, reason: `error: ${(err as Error).message}` });
+      const msg = (err as Error).message;
+      // "soft:" errors (e.g. bounced to an app gate page) skip the URL but
+      // don't indicate a dead session — they never abort the crawl.
+      if (msg.startsWith("soft:")) {
+        result.skipped.push({ url, reason: msg.slice(5).trim() });
+        continue;
+      }
+      result.skipped.push({ url, reason: `error: ${msg}` });
       if (++consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
         result.abortedReason = `${MAX_CONSECUTIVE_ERRORS} visits failed in a row (session logged out?)`;
         break;

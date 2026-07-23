@@ -167,6 +167,22 @@ describe("crawl", () => {
     expect(visits).toContain(`${ORIGIN}/from-ai`);
   });
 
+  it("soft errors (app-gate bounces) skip but never abort the crawl", async () => {
+    const seeds = Array.from({ length: 10 }, (_, i) => `${ORIGIN}/p${i}`);
+    const gated: PageDriver = {
+      visit: async (url) => {
+        if (!url.endsWith("/p9"))
+          throw new Error("soft: redirected to /shops (app gate?)");
+      },
+      collectLinks: async () => [],
+    };
+    const result = await crawl(gated, { origin: ORIGIN, seeds });
+    expect(result.abortedReason).toBeUndefined();
+    expect(result.visited).toEqual([`${ORIGIN}/p9`]); // reached the far end
+    expect(result.skipped).toHaveLength(9);
+    expect(result.skipped[0]!.reason).toBe("redirected to /shops (app gate?)");
+  });
+
   it("aborts after repeated consecutive visit failures (dead session)", async () => {
     const seeds = Array.from({ length: 10 }, (_, i) => `${ORIGIN}/p${i}`);
     const dead: PageDriver = {

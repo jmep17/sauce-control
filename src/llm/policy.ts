@@ -20,6 +20,8 @@ export interface Candidate {
   inputType?: string;
   /** For inputs/buttons inside a form: the form's method (get/post). */
   formMethod?: string;
+  /** For selects: the visible option labels (truncated). */
+  options?: string[];
   href?: string;
 }
 
@@ -34,8 +36,8 @@ export interface DecisionInput {
 
 export interface ExploreAction {
   id: number;
-  kind: "click" | "fill" | "fill_submit";
-  /** Text to type for fill / fill_submit. */
+  kind: "click" | "fill" | "fill_submit" | "select";
+  /** Text to type (fill/fill_submit) or the option label to pick (select). */
   value?: string;
 }
 
@@ -58,7 +60,10 @@ export const DECISION_SCHEMA = {
         type: "object",
         properties: {
           id: { type: "integer" },
-          kind: { type: "string", enum: ["click", "fill", "fill_submit"] },
+          kind: {
+            type: "string",
+            enum: ["click", "fill", "fill_submit", "select"],
+          },
           value: { type: "string" },
         },
         required: ["id", "kind"],
@@ -84,15 +89,18 @@ const SYSTEM_PROMPT = `You are the exploration policy of a network-traffic recor
 You are given a numbered menu of interactive elements on the current page. Choose up to 5 actions:
 - "click" elements that likely reveal data: tabs, filters, pagination, sort toggles, "view details", expanders, dropdown openers.
 - "fill" search/filter/text inputs with a short plausible value (e.g. "test", "a"); use "fill_submit" to also press Enter.
+- "select" a dropdown option: value must be one of the listed options. If the page is a gate (e.g. "pick a shop/org to continue"), selecting an option is the single most important action — do it first.
 - Put anything that could change or destroy data (logout, delete, remove, pay, save, invite, send) in "avoid" with a reason. When unsure, avoid.
 - Prefer elements likely to hit API endpoints NOT yet in the coverage list.
 - Never pick logout/sign-out under any circumstances.
 
+Every action's "id" is the element's # number from the menu (NOT an option index).
+
 Output exactly this JSON shape, nothing else:
-{"actions":[{"id":0,"kind":"click"},{"id":3,"kind":"fill_submit","value":"test"}],"avoid":[{"id":9,"reason":"why"}]}`;
+{"actions":[{"id":0,"kind":"click"},{"id":3,"kind":"fill_submit","value":"test"},{"id":5,"kind":"select","value":"Beta Shop"}],"avoid":[{"id":9,"reason":"why"}]}`;
 
 const RETRY_PROMPT = `That did not match the required shape. Reply with exactly one JSON object:
-{"actions":[{"id":<int>,"kind":"click"|"fill"|"fill_submit","value":"<string, for fills>"}],"avoid":[{"id":<int>,"reason":"<string>"}]}
+{"actions":[{"id":<int>,"kind":"click"|"fill"|"fill_submit"|"select","value":"<string: text to type, or option to select>"}],"avoid":[{"id":<int>,"reason":"<string>"}]}
 using ids from the element menu above.`;
 
 function buildUserPrompt(input: DecisionInput): string {
@@ -102,6 +110,7 @@ function buildUserPrompt(input: DecisionInput): string {
         `#${c.id} [${c.kind}]`,
         JSON.stringify(c.text.slice(0, 80)),
         c.inputType ? `type=${c.inputType}` : "",
+        c.options?.length ? `options=${JSON.stringify(c.options)}` : "",
         c.formMethod ? `form=${c.formMethod.toUpperCase()}` : "",
         c.href ? `href=${c.href.slice(0, 80)}` : "",
       ];
@@ -116,7 +125,7 @@ Form submits allowed: ${input.allowMutations ? "GET and POST" : "GET (search/fil
 Recorded so far: ${input.coverage.requests} requests covering:
   ${endpoints || "(nothing yet)"}
 
-Interactive elements:
+Interactive elements (the # number is the action id):
 ${cands}`;
 }
 
@@ -135,7 +144,9 @@ function parseDecision(text: string): ExploreDecision {
       typeof a === "object" &&
       a !== null &&
       Number.isInteger(a.id) &&
-      ["click", "fill", "fill_submit"].includes((a as ExploreAction).kind)
+      ["click", "fill", "fill_submit", "select"].includes(
+        (a as ExploreAction).kind
+      )
   );
   if (raw.actions.length > 0 && actions.length === 0)
     throw new Error(`no well-formed actions in: ${text.slice(0, 120)}`);

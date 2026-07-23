@@ -49,7 +49,7 @@ describe("attachHarRecorder", () => {
   it("persists entries to disk shortly after they arrive, with no flush or close", async () => {
     const harPath = tmpHarPath();
     const context = new EventEmitter();
-    attachHarRecorder(context, new HarStore(harPath), 5);
+    attachHarRecorder(context, new HarStore(harPath), { debounceMs: 5 });
 
     context.emit("response", fakeResponse());
 
@@ -67,7 +67,9 @@ describe("attachHarRecorder", () => {
   it("flush() writes immediately without waiting for the debounce", async () => {
     const harPath = tmpHarPath();
     const context = new EventEmitter();
-    const recorder = attachHarRecorder(context, new HarStore(harPath), 60_000);
+    const recorder = attachHarRecorder(context, new HarStore(harPath), {
+      debounceMs: 60_000,
+    });
 
     context.emit("response", fakeResponse());
     // Let the async body() capture settle, then force the write.
@@ -81,7 +83,7 @@ describe("attachHarRecorder", () => {
   it("records a response whose body is unavailable (e.g. a redirect)", async () => {
     const harPath = tmpHarPath();
     const context = new EventEmitter();
-    attachHarRecorder(context, new HarStore(harPath), 5);
+    attachHarRecorder(context, new HarStore(harPath), { debounceMs: 5 });
 
     context.emit(
       "response",
@@ -95,10 +97,76 @@ describe("attachHarRecorder", () => {
     expect(readEntries(harPath)[0]!.response.status).toBe(302);
   });
 
+  it("skips app-origin assets (but keeps its JSON) and static/streaming types", async () => {
+    const harPath = tmpHarPath();
+    const context = new EventEmitter();
+    attachHarRecorder(context, new HarStore(harPath), {
+      debounceMs: 5,
+      appOrigins: ["http://localhost:3000"],
+    });
+
+    // App's own dev server chunk — the launch dev server serves this itself.
+    context.emit(
+      "response",
+      fakeResponse({
+        url: () => "http://localhost:3000/_next/chunk.js",
+        headers: () => ({ "content-type": "application/javascript" }),
+      })
+    );
+    // App-origin JSON (vite proxy / _next/data) is still recorded.
+    context.emit(
+      "response",
+      fakeResponse({ url: () => "http://localhost:3000/api/session" })
+    );
+    // Static/streaming types are never replayed from the HAR.
+    for (const type of ["image/png", "font/woff2", "text/event-stream"]) {
+      context.emit(
+        "response",
+        fakeResponse({
+          url: () => `https://api.example.com/asset-${type.replace("/", "-")}`,
+          headers: () => ({ "content-type": type }),
+        })
+      );
+    }
+    // A real API response still lands.
+    context.emit("response", fakeResponse());
+
+    await vi.waitFor(() => {
+      expect(fs.existsSync(harPath)).toBe(true);
+      expect(readEntries(harPath)).toHaveLength(2);
+    });
+    const urls = readEntries(harPath).map((e) => e.request.url);
+    expect(urls).toContain("http://localhost:3000/api/session");
+    expect(urls).toContain("https://api.example.com/things?x=1");
+  });
+
+  it("stores oversized bodies as metadata only, keeping the HAR bounded", async () => {
+    const harPath = tmpHarPath();
+    const context = new EventEmitter();
+    attachHarRecorder(context, new HarStore(harPath), { debounceMs: 5 });
+
+    context.emit(
+      "response",
+      fakeResponse({
+        url: () => "https://api.example.com/huge-export",
+        body: async () => Buffer.alloc(3 * 1024 * 1024, "x"),
+      })
+    );
+
+    await vi.waitFor(() => expect(fs.existsSync(harPath)).toBe(true));
+    const entry = readEntries(harPath)[0]!;
+    expect(entry.response.content.text).toBeUndefined();
+    expect((entry.response.content as { size: number }).size).toBe(
+      3 * 1024 * 1024
+    );
+    // And the file itself stayed small.
+    expect(fs.statSync(harPath).size).toBeLessThan(100 * 1024);
+  });
+
   it("captured entries are replayable through HarStore.match", async () => {
     const harPath = tmpHarPath();
     const context = new EventEmitter();
-    attachHarRecorder(context, new HarStore(harPath), 5);
+    attachHarRecorder(context, new HarStore(harPath), { debounceMs: 5 });
 
     context.emit("response", fakeResponse());
     await vi.waitFor(() => expect(fs.existsSync(harPath)).toBe(true));

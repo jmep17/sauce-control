@@ -23,6 +23,8 @@ export interface ExplorePage {
   candidates(): Promise<Candidate[]>;
   click(id: number): Promise<void>;
   fill(id: number, value: string): Promise<void>;
+  /** Pick a dropdown option by its visible label. */
+  selectOption(id: number, label: string): Promise<void>;
   /** Press Enter in a filled input (submits its form). */
   pressEnter(id: number): Promise<void>;
   /** Return to `url` if an action navigated away. */
@@ -135,7 +137,19 @@ export async function exploreStep(
     );
   };
   for (const action of decision.actions.slice(0, maxActionsPerPage)) {
-    const cand = byId.get(action.id);
+    let cand = byId.get(action.id);
+    // Small models sometimes put the *option index* in id. If the chosen
+    // value matches exactly one dropdown's options, retarget deterministically.
+    if (
+      action.kind === "select" &&
+      action.value &&
+      (!cand || cand.kind !== "select")
+    ) {
+      const matches = candidates.filter(
+        (c) => c.kind === "select" && c.options?.includes(action.value!)
+      );
+      if (matches.length === 1) cand = matches[0];
+    }
     const record: ExecutedAction = {
       id: action.id,
       kind: action.kind,
@@ -173,6 +187,20 @@ export async function exploreStep(
       finish(record, cand);
       continue;
     }
+    if (action.kind === "select") {
+      if (cand.kind !== "select") {
+        record.outcome = "blocked";
+        record.detail = "not a dropdown";
+        finish(record, cand);
+        continue;
+      }
+      if (!action.value) {
+        record.outcome = "blocked";
+        record.detail = "select needs a value";
+        finish(record, cand);
+        continue;
+      }
+    }
     if (action.kind === "fill_submit" && !submitAllowed(cand, allowMutations)) {
       record.outcome = "blocked";
       record.detail = "non-GET form submit (use --allow-mutations)";
@@ -183,6 +211,8 @@ export async function exploreStep(
     try {
       if (action.kind === "click") {
         await page.click(cand.id);
+      } else if (action.kind === "select") {
+        await page.selectOption(cand.id, action.value!);
       } else {
         await page.fill(cand.id, action.value ?? "test");
         if (action.kind === "fill_submit") await page.pressEnter(cand.id);
@@ -203,6 +233,42 @@ export async function exploreStep(
       record.detail = (err as Error).message.slice(0, 200);
     }
     finish(record, cand);
+  }
+
+  // Gate-breaker: state-gated apps ("pick a shop to continue") must not
+  // depend on the model phrasing the select action correctly. If nothing
+  // executed successfully and the page has a safe dropdown, deterministically
+  // pick its first real option.
+  if (!result.executed.some((e) => e.outcome === "ok")) {
+    const dropdown = candidates.find(
+      (c) =>
+        c.kind === "select" && !unsafeReason(c) && (c.options?.length ?? 0) > 0
+    );
+    if (dropdown) {
+      const value = dropdown.options![1] ?? dropdown.options![0]!;
+      const record: ExecutedAction = {
+        id: dropdown.id,
+        kind: "select",
+        value,
+        outcome: "ok",
+        detail: "gate-breaker fallback",
+      };
+      result.executed.push(record);
+      try {
+        await page.selectOption(dropdown.id, value);
+        const nowUrl = page.url();
+        if (nowUrl !== pageUrl) {
+          if (nowUrl.startsWith(new URL(pageUrl).origin)) {
+            result.discovered.push(nowUrl);
+          }
+          await page.returnTo(pageUrl);
+        }
+      } catch (err) {
+        record.outcome = "error";
+        record.detail = (err as Error).message.slice(0, 200);
+      }
+      finish(record, dropdown);
+    }
   }
 
   logDecision({

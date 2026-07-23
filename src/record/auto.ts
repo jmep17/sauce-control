@@ -140,18 +140,67 @@ function makeDriver(
   navBuffer: string[],
   origin: string
 ): PageDriver {
+  // How often each landing path has swallowed a differently-addressed visit —
+  // a hub page every route redirects to means the app has an unmet state
+  // gate (e.g. "select a shop first"), not a dead session.
+  const bounces = new Map<string, number>();
   return {
     async visit(url) {
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 15_000 });
+      const target = new URL(url);
+      // Prefer clicking a real link: client-side routing preserves in-memory
+      // app state (selected shop, filters) that a full reload wipes.
+      let navigated = false;
+      if (page.url().startsWith(origin)) {
+        if (new URL(page.url()).pathname === target.pathname) {
+          navigated = true; // already here; just re-settle below
+        } else {
+          const clicked = (await page
+            .evaluate(
+              `(() => {
+                const want = ${JSON.stringify(target.pathname + target.search)};
+                const a = Array.from(document.querySelectorAll("a[href]")).find((el) => {
+                  try {
+                    const u = new URL(el.href);
+                    return u.pathname + u.search === want &&
+                      !el.closest(${JSON.stringify(DEVTOOLS_EXCLUDE)});
+                  } catch { return false; }
+                });
+                if (!a) return false;
+                a.click();
+                return true;
+              })()`
+            )
+            .catch(() => false)) as boolean;
+          if (clicked) {
+            await settle(page);
+            navigated = new URL(page.url()).pathname === target.pathname;
+          }
+        }
+      }
+      if (!navigated) {
+        await page.goto(url, {
+          waitUntil: "domcontentloaded",
+          timeout: 15_000,
+        });
+      }
       await settle(page);
+
       const landed = page.url();
       if (!landed.startsWith(origin)) {
         throw new Error(`redirected off-origin to ${landed} (logged out?)`);
       }
-      const requested = new URL(url).pathname;
       const got = new URL(landed).pathname;
-      if (got !== requested && AUTH_PLUMBING_PATTERN.test(got)) {
-        throw new Error(`bounced to ${got} (session logged out?)`);
+      if (got !== target.pathname) {
+        if (AUTH_PLUMBING_PATTERN.test(got)) {
+          throw new Error(`bounced to ${got} (session logged out?)`);
+        }
+        const n = (bounces.get(got) ?? 0) + 1;
+        bounces.set(got, n);
+        if (n >= 3) {
+          throw new Error(
+            `soft: redirected to ${got} (app gate? finish any required setup in the browser before pressing Enter)`
+          );
+        }
       }
     },
     async collectLinks() {
@@ -200,7 +249,22 @@ const CANDIDATES_SCRIPT = `(() => {
       if (["hidden", "password", "file", "checkbox", "radio", "button"].includes(t)) continue;
       push(el, "input", Object.assign({ inputType: t }, formMethod(el)));
     } else if (tag === "select") {
-      push(el, "select", formMethod(el));
+      const options = Array.from(el.options)
+        .map((o) => (o.textContent || "").trim().slice(0, 40))
+        .filter(Boolean)
+        .slice(0, 8);
+      // innerText of a select concatenates every option — use the selected
+      // option (usually the placeholder) as the label instead.
+      const sel = el.selectedOptions && el.selectedOptions[0];
+      const selText = sel ? (sel.textContent || "").trim().slice(0, 120) : "";
+      push(
+        el,
+        "select",
+        Object.assign(
+          selText ? { text: selText, options } : { options },
+          formMethod(el)
+        )
+      );
     } else if (el.getAttribute("role") === "tab") {
       push(el, "tab", {});
     } else {
@@ -224,15 +288,30 @@ function makeExplorePage(page: Page): ExplorePage {
     async fill(id, value) {
       await page.fill(sel(id), value, { timeout: 3_000 });
     },
+    async selectOption(id, label) {
+      // Match by visible label first, then by value attribute.
+      try {
+        await page.selectOption(sel(id), { label }, { timeout: 3_000 });
+      } catch {
+        await page.selectOption(sel(id), label, { timeout: 3_000 });
+      }
+      await settle(page);
+    },
     async pressEnter(id) {
       await page.press(sel(id), "Enter", { timeout: 3_000 });
       await settle(page);
     },
     async returnTo(url) {
-      await page
-        .goto(url, { waitUntil: "domcontentloaded", timeout: 15_000 })
-        .catch(() => {});
+      // Browser-back first: for SPAs it's a client-side popstate that keeps
+      // app state alive, where a reload would wipe it.
+      await page.goBack({ timeout: 5_000 }).catch(() => {});
       await settle(page);
+      if (page.url() !== url) {
+        await page
+          .goto(url, { waitUntil: "domcontentloaded", timeout: 15_000 })
+          .catch(() => {});
+        await settle(page);
+      }
     },
   };
 }
@@ -344,7 +423,10 @@ export async function runAuto(args: {
 
   const result = await crawl(makeDriver(page, navBuffer, origin), {
     origin,
-    seeds: [origin, ...routes.map((r) => origin + r)],
+    // Current page first: for state-gated apps the user just did the setup
+    // (picked a shop, etc.) right here — harvest its links before any
+    // navigation can lose that context.
+    seeds: [page.url(), origin, ...routes.map((r) => origin + r)],
     avoidHosts: auth0Hosts(session),
     ...(opts.maxPages !== undefined ? { maxPages: opts.maxPages } : {}),
     ...(policy ? { onPage } : {}),
@@ -365,6 +447,14 @@ export async function runAuto(args: {
   }
   if (result.abortedReason) {
     log.warn(`Auto-explore aborted: ${result.abortedReason}`);
+  }
+  const gateBounces = result.skipped.filter((s) =>
+    s.reason.includes("app gate")
+  );
+  if (gateBounces.length > 0) {
+    log.warn(
+      `${gateBounces.length} routes redirected to the same page — the app likely needs setup (e.g. picking a shop/org) before those routes work. Do that in the browser, then rerun and press Enter after.`
+    );
   }
   if (policy) {
     log.info(
